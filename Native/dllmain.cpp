@@ -1,132 +1,230 @@
 #include <cstdint>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
 #include <ReClassNET_Plugin.hpp>
+#include "Protocol.hpp"
 
-/// <summary>Enumerate all processes on the system.</summary>
-/// <param name="callbackProcess">The callback for a process.</param>
+namespace
+{
+    constexpr const char* DEFAULT_HOST = "127.0.0.1";
+    constexpr int DEFAULT_PORT = 27042;
+
+    protocol::Client g_client;
+    std::mutex g_client_mutex;
+
+    struct ProcessHandle
+    {
+        int process_id;
+        std::atomic<bool> valid{true};
+    };
+
+    std::unordered_map<RC_Pointer, ProcessHandle*> g_handles;
+    std::mutex g_handles_mutex;
+    std::atomic<uintptr_t> g_next_handle{1};
+
+    bool ensure_connected()
+    {
+        if (g_client.is_connected())
+            return true;
+        return g_client.connect(DEFAULT_HOST, DEFAULT_PORT);
+    }
+
+    void utf8_to_utf16(const std::string& src, RC_UnicodeChar* dst, size_t max_len)
+    {
+        size_t i = 0;
+        for (char c : src)
+        {
+            if (i >= max_len - 1)
+                break;
+            dst[i++] = static_cast<RC_UnicodeChar>(static_cast<unsigned char>(c));
+        }
+        dst[i] = 0;
+    }
+}
+
 extern "C" void RC_CallConv EnumerateProcesses(EnumerateProcessCallback callbackProcess)
 {
-	// Enumerate all processes with the current plattform (x86/x64) and call the callback.
+    std::lock_guard<std::mutex> lock(g_client_mutex);
+
+    if (!ensure_connected())
+        return;
+
+    auto processes = g_client.get_process_list();
+
+    for (const auto& proc : processes)
+    {
+        EnumerateProcessData data{};
+        data.Id = reinterpret_cast<RC_Pointer>(static_cast<uintptr_t>(proc.process_id));
+        utf8_to_utf16(proc.name, data.Name, 260);
+        utf8_to_utf16(proc.name, data.Path, 260);
+
+        callbackProcess(&data);
+    }
 }
 
-/// <summary>Enumerate all sections and modules of the remote process.</summary>
-/// <param name="process">The process handle obtained by OpenRemoteProcess.</param>
-/// <param name="callbackSection">The callback for a section.</param>
-/// <param name="callbackModule">The callback for a module.</param>
-extern "C" void RC_CallConv EnumerateRemoteSectionsAndModules(RC_Pointer handle, EnumerateRemoteSectionsCallback callbackSection, EnumerateRemoteModulesCallback callbackModule)
+extern "C" void RC_CallConv EnumerateRemoteSectionsAndModules(
+    RC_Pointer handle,
+    EnumerateRemoteSectionsCallback callbackSection,
+    EnumerateRemoteModulesCallback callbackModule)
 {
-	// Enumerate all sections and modules of the remote process and call the callback for them.
 }
 
-/// <summary>Opens the remote process.</summary>
-/// <param name="id">The identifier of the process returned by EnumerateProcesses.</param>
-/// <param name="desiredAccess">The desired access.</param>
-/// <returns>A handle to the remote process or nullptr if an error occured.</returns>
 extern "C" RC_Pointer RC_CallConv OpenRemoteProcess(RC_Pointer id, ProcessAccess desiredAccess)
 {
-	// Open the remote process with the desired access rights and return the handle to use with the other functions.
+    int process_id = static_cast<int>(reinterpret_cast<uintptr_t>(id));
 
-	return nullptr;
+    auto* ph = new ProcessHandle();
+    ph->process_id = process_id;
+    ph->valid = true;
+
+    RC_Pointer handle = reinterpret_cast<RC_Pointer>(g_next_handle.fetch_add(1));
+
+    {
+        std::lock_guard<std::mutex> lock(g_handles_mutex);
+        g_handles[handle] = ph;
+    }
+
+    return handle;
 }
 
-/// <summary>Queries if the process is valid.</summary>
-/// <param name="handle">The process handle obtained by OpenRemoteProcess.</param>
-/// <returns>True if the process is valid, false if not.</returns>
 extern "C" bool RC_CallConv IsProcessValid(RC_Pointer handle)
 {
-	// Check if the handle is valid.
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
 
-	return false;
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end())
+        return false;
+
+    return it->second->valid.load();
 }
 
-/// <summary>Closes the handle to the remote process.</summary>
-/// <param name="handle">The process handle obtained by OpenRemoteProcess.</param>
 extern "C" void RC_CallConv CloseRemoteProcess(RC_Pointer handle)
 {
-	// Close the handle to the remote process.
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+
+    auto it = g_handles.find(handle);
+    if (it != g_handles.end())
+    {
+        delete it->second;
+        g_handles.erase(it);
+    }
 }
 
-/// <summary>Reads memory of the remote process.</summary>
-/// <param name="handle">The process handle obtained by OpenRemoteProcess.</param>
-/// <param name="address">The address to read from.</param>
-/// <param name="buffer">The buffer to read into.</param>
-/// <param name="offset">The offset into the buffer.</param>
-/// <param name="size">The number of bytes to read.</param>
-/// <returns>True if it succeeds, false if it fails.</returns>
-extern "C" bool RC_CallConv ReadRemoteMemory(RC_Pointer handle, RC_Pointer address, RC_Pointer buffer, int offset, int size)
+extern "C" bool RC_CallConv ReadRemoteMemory(
+    RC_Pointer handle,
+    RC_Pointer address,
+    RC_Pointer buffer,
+    int offset,
+    int size)
 {
-	// Read the memory of the remote process into the buffer.
+    ProcessHandle* ph = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_handles_mutex);
+        auto it = g_handles.find(handle);
+        if (it == g_handles.end())
+            return false;
+        ph = it->second;
+    }
 
-	return false;
+    if (!ph->valid.load())
+        return false;
+
+    std::lock_guard<std::mutex> lock(g_client_mutex);
+
+    if (!ensure_connected())
+    {
+        ph->valid = false;
+        return false;
+    }
+
+    uint64_t addr = reinterpret_cast<uint64_t>(address);
+    auto data = g_client.read_memory(ph->process_id, addr, size);
+
+    if (data.empty())
+    {
+        return false;
+    }
+
+    std::memcpy(static_cast<char*>(buffer) + offset, data.data(), data.size());
+    return true;
 }
 
-/// <summary>Writes memory to the remote process.</summary>
-/// <param name="process">The process handle obtained by OpenRemoteProcess.</param>
-/// <param name="address">The address to write to.</param>
-/// <param name="buffer">The buffer to write.</param>
-/// <param name="offset">The offset into the buffer.</param>
-/// <param name="size">The number of bytes to write.</param>
-/// <returns>True if it succeeds, false if it fails.</returns>
-extern "C" bool RC_CallConv WriteRemoteMemory(RC_Pointer handle, RC_Pointer address, RC_Pointer buffer, int offset, int size)
+extern "C" bool RC_CallConv WriteRemoteMemory(
+    RC_Pointer handle,
+    RC_Pointer address,
+    RC_Pointer buffer,
+    int offset,
+    int size)
 {
-	// Write the buffer into the memory of the remote process.
+    ProcessHandle* ph = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_handles_mutex);
+        auto it = g_handles.find(handle);
+        if (it == g_handles.end())
+            return false;
+        ph = it->second;
+    }
 
-	return false;
+    if (!ph->valid.load())
+        return false;
+
+    std::lock_guard<std::mutex> lock(g_client_mutex);
+
+    if (!ensure_connected())
+    {
+        ph->valid = false;
+        return false;
+    }
+
+    uint64_t addr = reinterpret_cast<uint64_t>(address);
+    const char* src = static_cast<const char*>(buffer) + offset;
+
+    return g_client.write_memory(ph->process_id, addr, src, size);
 }
 
-/// <summary>Control the remote process (Pause, Resume, Terminate).</summary>
-/// <param name="handle">The process handle obtained by OpenRemoteProcess.</param>
-/// <param name="action">The action to perform.</param>
 extern "C" void RC_CallConv ControlRemoteProcess(RC_Pointer handle, ControlRemoteProcessAction action)
 {
-	// Perform the desired action on the remote process.
 }
 
-/// <summary>Attach a debugger to the process.</summary>
-/// <param name="id">The identifier of the process returned by EnumerateProcesses.</param>
-/// <returns>True if it succeeds, false if it fails.</returns>
 extern "C" bool RC_CallConv AttachDebuggerToProcess(RC_Pointer id)
 {
-	// Attach a debugger to the remote process.
-
-	return false;
+    return false;
 }
 
-/// <summary>Detach a debugger from the remote process.</summary>
-/// <param name="id">The identifier of the process returned by EnumerateProcesses.</param>
 extern "C" void RC_CallConv DetachDebuggerFromProcess(RC_Pointer id)
 {
-	// Detach the debugger.
 }
 
-/// <summary>Wait for a debug event within the given timeout.</summary>
-/// <param name="evt">[out] The occured debug event.</param>
-/// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-/// <returns>True if an event occured within the given timeout, false if not.</returns>
 extern "C" bool RC_CallConv AwaitDebugEvent(DebugEvent* evt, int timeoutInMilliseconds)
 {
-	// Wait for a debug event.
-
-	return false;
+    return false;
 }
 
-/// <summary>Handles the debug event described by evt.</summary>
-/// <param name="evt">[in] The (modified) event returned by AwaitDebugEvent.</param>
 extern "C" void RC_CallConv HandleDebugEvent(DebugEvent* evt)
 {
-	// Handle the debug event.
 }
 
-/// <summary>Sets a hardware breakpoint.</summary>
-/// <param name="processId">The identifier of the process returned by EnumerateProcesses.</param>
-/// <param name="address">The address of the breakpoint.</param>
-/// <param name="reg">The register to use.</param>
-/// <param name="type">The type of the breakpoint.</param>
-/// <param name="size">The size of the breakpoint.</param>
-/// <param name="set">True to set the breakpoint, false to remove it.</param>
-/// <returns>True if it succeeds, false if it fails.</returns>
-extern "C" bool RC_CallConv SetHardwareBreakpoint(RC_Pointer id, RC_Pointer address, HardwareBreakpointRegister reg, HardwareBreakpointTrigger type, HardwareBreakpointSize size, bool set)
+extern "C" bool RC_CallConv SetHardwareBreakpoint(
+    RC_Pointer id,
+    RC_Pointer address,
+    HardwareBreakpointRegister reg,
+    HardwareBreakpointTrigger type,
+    HardwareBreakpointSize size,
+    bool set)
 {
-	// Set a hardware breakpoint with the given parameters.
+    return false;
+}
 
-	return false;
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+        break;
+    case DLL_PROCESS_DETACH:
+        g_client.disconnect();
+        break;
+    }
+    return TRUE;
 }
