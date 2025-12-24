@@ -29,21 +29,9 @@ namespace
             return true;
         return g_client.connect(DEFAULT_HOST, DEFAULT_PORT);
     }
-
-    void utf8_to_utf16(const std::string& src, RC_UnicodeChar* dst, size_t max_len)
-    {
-        size_t i = 0;
-        for (char c : src)
-        {
-            if (i >= max_len - 1)
-                break;
-            dst[i++] = static_cast<RC_UnicodeChar>(static_cast<unsigned char>(c));
-        }
-        dst[i] = 0;
-    }
 }
 
-extern "C" void RC_CallConv EnumerateProcesses(EnumerateProcessCallback callbackProcess)
+extern "C" void RC_CallConv EnumerateProcesses(EnumerateProcessCallback* callbackProcess)
 {
     std::lock_guard<std::mutex> lock(g_client_mutex);
 
@@ -55,9 +43,9 @@ extern "C" void RC_CallConv EnumerateProcesses(EnumerateProcessCallback callback
     for (const auto& proc : processes)
     {
         EnumerateProcessData data{};
-        data.Id = reinterpret_cast<RC_Pointer>(static_cast<uintptr_t>(proc.process_id));
-        utf8_to_utf16(proc.name, data.Name, 260);
-        utf8_to_utf16(proc.name, data.Path, 260);
+        data.Id = static_cast<RC_Size>(proc.process_id);
+        MultiByteToUnicode(proc.name.c_str(), data.Name, PATH_MAXIMUM_LENGTH);
+        MultiByteToUnicode(proc.name.c_str(), data.Path, PATH_MAXIMUM_LENGTH);
 
         callbackProcess(&data);
     }
@@ -65,14 +53,14 @@ extern "C" void RC_CallConv EnumerateProcesses(EnumerateProcessCallback callback
 
 extern "C" void RC_CallConv EnumerateRemoteSectionsAndModules(
     RC_Pointer handle,
-    EnumerateRemoteSectionsCallback callbackSection,
-    EnumerateRemoteModulesCallback callbackModule)
+    EnumerateRemoteSectionsCallback* callbackSection,
+    EnumerateRemoteModulesCallback* callbackModule)
 {
 }
 
-extern "C" RC_Pointer RC_CallConv OpenRemoteProcess(RC_Pointer id, ProcessAccess desiredAccess)
+extern "C" RC_Pointer RC_CallConv OpenRemoteProcess(RC_Size id, ProcessAccess desiredAccess)
 {
-    int process_id = static_cast<int>(reinterpret_cast<uintptr_t>(id));
+    int process_id = static_cast<int>(id);
 
     auto* ph = new ProcessHandle();
     ph->process_id = process_id;
@@ -187,12 +175,12 @@ extern "C" void RC_CallConv ControlRemoteProcess(RC_Pointer handle, ControlRemot
 {
 }
 
-extern "C" bool RC_CallConv AttachDebuggerToProcess(RC_Pointer id)
+extern "C" bool RC_CallConv AttachDebuggerToProcess(RC_Size id)
 {
     return false;
 }
 
-extern "C" void RC_CallConv DetachDebuggerFromProcess(RC_Pointer id)
+extern "C" void RC_CallConv DetachDebuggerFromProcess(RC_Size id)
 {
 }
 
@@ -206,7 +194,7 @@ extern "C" void RC_CallConv HandleDebugEvent(DebugEvent* evt)
 }
 
 extern "C" bool RC_CallConv SetHardwareBreakpoint(
-    RC_Pointer id,
+    RC_Size id,
     RC_Pointer address,
     HardwareBreakpointRegister reg,
     HardwareBreakpointTrigger type,
